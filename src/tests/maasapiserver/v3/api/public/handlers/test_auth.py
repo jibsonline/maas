@@ -56,7 +56,7 @@ from maasservicelayer.exceptions.constants import (
     UNEXISTING_USER_OR_INVALID_CREDENTIALS_VIOLATION_TYPE,
     UNIQUE_CONSTRAINT_VIOLATION_TYPE,
 )
-from maasservicelayer.models.base import ListResult
+from maasservicelayer.models.base import ListResult, Unset
 from maasservicelayer.models.django_session import DjangoSession
 from maasservicelayer.models.external_auth import (
     AccessTokenType,
@@ -585,6 +585,87 @@ class TestAuthApi:
         )
         assert updated_provider_response.token_type == request_body.token_type
 
+    async def test_update_oauth_provider_group_sync(
+        self,
+        services_mock: Mock,
+        mocked_api_client_user_with_permissions: Callable[..., AsyncClient],
+    ):
+        client = mocked_api_client_user_with_permissions(
+            MAASResourceEntitlement.CAN_EDIT_IDENTITIES,
+        )
+        group_sync = {
+            "enabled": True,
+            "claim": "roles",
+            "group_map": {"maas-admins": "Administrators"},
+        }
+        request_body = OAuthProviderRequest(
+            name="test_provider",
+            client_id="test_client_id",
+            client_secret="test_secret",
+            issuer_url="https://example.com",
+            redirect_uri="https://example.com/callback",
+            scopes="openid email profile",
+            token_type=OAuthTokenTypeChoices.JWT,
+            enabled=True,
+            vendor=OAuthVendorChoices.GENERIC,
+            group_sync=group_sync,
+        )
+        services_mock.external_oauth.update_provider.return_value = (
+            TEST_PROVIDER_1.model_copy(
+                update={"config": {"group_sync": group_sync}}
+            )
+        )
+
+        response = await client.put(
+            f"{self.BASE_PATH}/oauth/providers/1",
+            json=jsonable_encoder(request_body.model_dump()),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["group_sync"] == group_sync
+        builder = (
+            services_mock.external_oauth.update_provider.call_args.kwargs[
+                "builder"
+            ]
+        )
+        assert builder.config == {"group_sync": group_sync}
+
+    async def test_update_oauth_provider_without_group_sync_keeps_config(
+        self,
+        services_mock: Mock,
+        mocked_api_client_user_with_permissions: Callable[..., AsyncClient],
+    ):
+        client = mocked_api_client_user_with_permissions(
+            MAASResourceEntitlement.CAN_EDIT_IDENTITIES,
+        )
+        request_body = OAuthProviderRequest(
+            name="test_provider",
+            client_id="test_client_id",
+            client_secret="test_secret",
+            issuer_url="https://example.com",
+            redirect_uri="https://example.com/callback",
+            scopes="openid email profile",
+            token_type=OAuthTokenTypeChoices.JWT,
+            enabled=True,
+            vendor=OAuthVendorChoices.GENERIC,
+        )
+        services_mock.external_oauth.update_provider.return_value = (
+            TEST_PROVIDER_1
+        )
+
+        response = await client.put(
+            f"{self.BASE_PATH}/oauth/providers/1",
+            json=jsonable_encoder(request_body.model_dump()),
+        )
+
+        assert response.status_code == 200
+        builder = (
+            services_mock.external_oauth.update_provider.call_args.kwargs[
+                "builder"
+            ]
+        )
+        assert isinstance(builder.config, Unset)
+
     async def test_update_oauth_provider_not_found(
         self,
         services_mock: Mock,
@@ -893,6 +974,11 @@ class TestAuthApi:
             "token_type": "JWT",
             "user_count": 5,
             "vendor": "Generic",
+            "group_sync": {
+                "enabled": False,
+                "claim": "groups",
+                "group_map": {},
+            },
         }
 
     async def test_get_active_oauth_provider_not_found(

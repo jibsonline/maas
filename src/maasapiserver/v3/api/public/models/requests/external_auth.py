@@ -10,6 +10,7 @@ from maasservicelayer.builders.external_auth import OAuthProviderBuilder
 from maasservicelayer.exceptions.catalog import ValidationException
 from maasservicelayer.models.external_auth import (
     AccessTokenType,
+    OIDCGroupSyncConfig,
     ProviderVendorType,
 )
 
@@ -54,6 +55,14 @@ class OAuthProviderRequest(BaseModel):
     enabled: bool = Field(
         description="Specifies whether this provider should be enabled for user authentication.",
     )
+    group_sync: OIDCGroupSyncConfig | None = Field(
+        default=None,
+        description=(
+            "Sync MAAS user groups from the provider's groups claim on each "
+            "login. If the claim is missing, groups are not changed. Leave "
+            "unset to keep the current setting."
+        ),
+    )
 
     @field_validator("issuer_url", "redirect_uri")
     @classmethod
@@ -74,7 +83,13 @@ class OAuthProviderRequest(BaseModel):
             else AccessTokenType.OPAQUE
         )
         vendor = ProviderVendorType[self.vendor.name]
+        extra = {}
+        if self.group_sync is not None:
+            extra["config"] = {
+                OIDCGroupSyncConfig.CONFIG_KEY: self.group_sync.model_dump()
+            }
         return OAuthProviderBuilder(
+            **extra,
             name=self.name,
             client_id=self.client_id,
             client_secret=self.client_secret,

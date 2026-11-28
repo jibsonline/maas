@@ -59,6 +59,7 @@ class OAuthUserData:
     given_name: str | None
     family_name: str | None
     name: str | None
+    groups: list[str] | None = None
 
 
 @dataclass
@@ -139,7 +140,9 @@ class OAuth2Client:
     async def get_userinfo(
         self, access_token: OAuthAccessToken | str, id_token_claims: JWTClaims
     ) -> OAuthUserData:
-        allowed_keys = OAuthUserData.__annotations__.keys()
+        allowed_keys = [
+            k for k in OAuthUserData.__annotations__.keys() if k != "groups"
+        ]
 
         # Try fetching claims from ID token first
         claims = {
@@ -148,15 +151,39 @@ class OAuth2Client:
 
         missing_keys = [k for k in allowed_keys if k not in claims]
 
-        if not missing_keys:
-            return OAuthUserData(**claims)
+        group_sync = self.provider.group_sync
+        groups_claim = group_sync.claim if group_sync.enabled else None
+        raw_groups = (
+            id_token_claims.get(groups_claim) if groups_claim else None
+        )
+
+        # Some providers only put groups in userinfo. A missing groups claim
+        # must not fail the login, so only ask when there is an endpoint.
+        needs_userinfo_for_groups = (
+            groups_claim is not None
+            and raw_groups is None
+            and self.provider.metadata.userinfo_endpoint is not None
+        )
+        if not missing_keys and not needs_userinfo_for_groups:
+            return OAuthUserData(
+                **claims, groups=self._normalize_groups(raw_groups)
+            )
 
         token_str = (
             access_token
             if isinstance(access_token, str)
             else access_token.encoded
         )
-        response = await self._userinfo_request(access_token=token_str)
+        try:
+            response = await self._userinfo_request(access_token=token_str)
+        except Exception:
+            if missing_keys:
+                raise
+            logger.warning(
+                "Could not read the groups claim from userinfo, "
+                "user groups are left unchanged."
+            )
+            return OAuthUserData(**claims, groups=None)
 
         # Mandatory security check
         if response.get("sub") != id_token_claims.get("sub"):
@@ -174,13 +201,37 @@ class OAuth2Client:
             if k in response:
                 claims[k] = response[k]
 
+        if groups_claim and raw_groups is None:
+            raw_groups = response.get(groups_claim)
+
         return OAuthUserData(
             sub=claims["sub"],
             email=claims["email"],
             given_name=claims.get("given_name", None),
             family_name=claims.get("family_name", None),
             name=claims.get("name", None),
+            groups=self._normalize_groups(raw_groups),
         )
+
+    @staticmethod
+    def _normalize_groups(raw_groups: Any) -> list[str] | None:
+        """Turn a groups claim into a list of group names.
+
+        Providers send a list, or a single string when there is one group.
+        Keycloak sends full paths such as "/maas/admins", reduced here to
+        the last part.
+        """
+        if raw_groups is None:
+            return None
+        if isinstance(raw_groups, str):
+            raw_groups = [raw_groups]
+        if not isinstance(raw_groups, list):
+            return None
+        return [
+            group.rstrip("/").rsplit("/", 1)[-1]
+            for group in raw_groups
+            if isinstance(group, str) and group.strip("/")
+        ]
 
     async def validate_access_token(
         self, access_token: str

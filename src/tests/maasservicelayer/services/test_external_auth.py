@@ -53,6 +53,7 @@ from maasservicelayer.models.external_auth import (
     ProviderMetadata,
     ProviderVendorType,
 )
+from maasservicelayer.models.usergroups import UserGroup
 from maasservicelayer.models.users import User, UserProfile
 from maasservicelayer.services import SecretsService, UsersService
 from maasservicelayer.services.base import BaseService
@@ -62,6 +63,7 @@ from maasservicelayer.services.external_auth import (
 )
 from maasservicelayer.services.secrets import SecretNotFound
 from maasservicelayer.services.tokens import OIDCRevokedTokenService
+from maasservicelayer.services.usergroups import UserGroupsService
 from maasservicelayer.utils.date import utcnow
 from maasservicelayer.utils.encryptor import Encryptor
 from tests.maasservicelayer.services.base import ServiceCommonTests
@@ -77,6 +79,7 @@ class TestExternalOAuthService(ServiceCommonTests):
             revoked_tokens_service=Mock(OIDCRevokedTokenService),
             secrets_service=Mock(SecretsService),
             users_service=Mock(UsersService),
+            usergroups_service=Mock(UserGroupsService),
             cache=Mock(ExternalOAuthServiceCache),
         )
 
@@ -1072,3 +1075,190 @@ class TestExternalOAuthService(ServiceCommonTests):
         assert details is not None
         assert details[0].message == "Failed to parse ID token."
         assert details[0].type == INVALID_TOKEN_VIOLATION_TYPE
+
+    def _sync_user(self) -> User:
+        now = utcnow()
+        return User(
+            id=7,
+            username="user@example.com",
+            password="",
+            is_superuser=False,
+            first_name="",
+            last_name="",
+            is_staff=False,
+            is_active=True,
+            last_login=now,
+            date_joined=now,
+        )
+
+    def _sync_provider(
+        self, test_instance: OAuthProvider, **group_sync
+    ) -> OAuthProvider:
+        return test_instance.model_copy(
+            update={"config": {"group_sync": {"enabled": True, **group_sync}}}
+        )
+
+    def _mock_groups(
+        self,
+        service_instance: ExternalOAuthService,
+        current_group_ids: set[int],
+    ) -> None:
+        now = utcnow()
+        service_instance.usergroups_service.list_all = AsyncMock(
+            return_value=[
+                UserGroup(
+                    id=1, name="Administrators", created=now, updated=now
+                ),
+                UserGroup(id=2, name="Users", created=now, updated=now),
+                UserGroup(id=3, name="Operators", created=now, updated=now),
+            ]
+        )
+        service_instance.usergroups_service.list_group_ids_for_user = (
+            AsyncMock(return_value=current_group_ids)
+        )
+        service_instance.usergroups_service.add_user_to_group_by_id = (
+            AsyncMock()
+        )
+        service_instance.usergroups_service.remove_user_from_group = (
+            AsyncMock()
+        )
+
+    async def test_sync_user_groups_disabled(
+        self,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+    ) -> None:
+        self._mock_groups(service_instance, {1})
+
+        await service_instance.sync_user_groups(
+            self._sync_user(), test_instance, ["Users"]
+        )
+
+        service_instance.usergroups_service.list_all.assert_not_awaited()
+
+    async def test_sync_user_groups_missing_claim(
+        self,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+    ) -> None:
+        self._mock_groups(service_instance, {1})
+
+        await service_instance.sync_user_groups(
+            self._sync_user(), self._sync_provider(test_instance), None
+        )
+
+        service_instance.usergroups_service.list_all.assert_not_awaited()
+
+    async def test_sync_user_groups_by_name_manages_every_group(
+        self,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+    ) -> None:
+        self._mock_groups(service_instance, {1, 3})
+
+        await service_instance.sync_user_groups(
+            self._sync_user(),
+            self._sync_provider(test_instance),
+            ["Users", "Operators", "not-a-maas-group"],
+        )
+
+        usergroups = service_instance.usergroups_service
+        usergroups.add_user_to_group_by_id.assert_awaited_once_with(7, 2)
+        usergroups.remove_user_from_group.assert_awaited_once_with(1, 7)
+
+    async def test_sync_user_groups_with_map_leaves_other_groups(
+        self,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+    ) -> None:
+        self._mock_groups(service_instance, {2, 3})
+
+        await service_instance.sync_user_groups(
+            self._sync_user(),
+            self._sync_provider(
+                test_instance,
+                group_map={
+                    "maas-admins": "Administrators",
+                    "maas-users": "Users",
+                    "gone": "Deleted group",
+                },
+            ),
+            ["maas-admins", "Operators"],
+        )
+
+        usergroups = service_instance.usergroups_service
+        usergroups.add_user_to_group_by_id.assert_awaited_once_with(7, 1)
+        usergroups.remove_user_from_group.assert_awaited_once_with(2, 7)
+
+    @patch("maasservicelayer.services.external_auth.logger")
+    async def test_sync_user_groups_error_does_not_raise(
+        self,
+        mock_logger: Mock,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+    ) -> None:
+        self._mock_groups(service_instance, set())
+        service_instance.usergroups_service.list_all = AsyncMock(
+            side_effect=Exception("db down")
+        )
+
+        await service_instance.sync_user_groups(
+            self._sync_user(), self._sync_provider(test_instance), ["Users"]
+        )
+
+        mock_logger.exception.assert_called_once()
+
+    async def test_get_callback_syncs_groups(
+        self,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+    ) -> None:
+        provider = self._sync_provider(test_instance)
+        user = self._sync_user()
+        mock_client = AsyncMock()
+        mock_client.provider = provider
+        mock_client.callback = AsyncMock(
+            return_value=OAuthCallbackData(
+                tokens=Mock(OAuthTokenData),
+                user_info=OAuthUserData(
+                    sub="user123",
+                    email="user@example.com",
+                    given_name=None,
+                    family_name=None,
+                    name=None,
+                    groups=["Users"],
+                ),
+            )
+        )
+        service_instance.get_client = AsyncMock(return_value=mock_client)
+        service_instance.users_service.get_or_create = AsyncMock(
+            return_value=(user, False)
+        )
+        service_instance.sync_user_groups = AsyncMock()
+
+        await service_instance.get_callback(code="code", nonce="nonce")
+
+        service_instance.sync_user_groups.assert_awaited_once_with(
+            user, provider, ["Users"]
+        )
+
+    async def test_update_provider_keeps_other_config_keys(
+        self,
+        service_instance: ExternalOAuthService,
+        test_instance: OAuthProvider,
+        builder_model: type[OAuthProviderBuilder],
+    ) -> None:
+        existing = test_instance.model_copy(
+            update={"config": {"other": "value", "group_sync": {}}}
+        )
+        service_instance.get_provider = AsyncMock(return_value=existing)
+        service_instance.get_by_id = AsyncMock(return_value=existing)
+        service_instance.update_by_id = AsyncMock(return_value=existing)
+        builder = builder_model(config={"group_sync": {"enabled": True}})
+
+        await service_instance.update_provider(id=1, builder=builder)
+
+        assert builder.config == {
+            "other": "value",
+            "group_sync": {"enabled": True},
+        }

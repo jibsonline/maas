@@ -13,6 +13,7 @@ from maasapiserver.v3.api.public.models.responses.base import PaginatedResponse
 from maasservicelayer.models.external_auth import (
     AccessTokenType,
     OAuthProvider,
+    OIDCGroupSyncConfig,
     ProviderMetadata,
 )
 
@@ -73,6 +74,9 @@ class OAuthProviderResponse(BaseModel):
     user_count: int | None = None
     token_type: OAuthTokenTypeChoices
     vendor: OAuthVendorChoices
+    group_sync: OIDCGroupSyncConfig = Field(
+        default_factory=OIDCGroupSyncConfig
+    )
 
     @classmethod
     def from_model(
@@ -93,6 +97,7 @@ class OAuthProviderResponse(BaseModel):
             if provider.token_type == AccessTokenType.JWT
             else OAuthTokenTypeChoices.OPAQUE,
             vendor=OAuthVendorChoices[provider.vendor.name],
+            group_sync=provider.group_sync,
         )
 
 

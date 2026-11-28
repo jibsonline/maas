@@ -102,6 +102,12 @@ class UserGroupsService(
             )
         )
 
+    async def list_group_ids_for_user(self, user_id: int) -> set[int]:
+        members = await self.usergroup_members_repository.list_all(
+            QuerySpec(where=UserGroupMembersClauseFactory.with_id(user_id))
+        )
+        return {member.group_id for member in members}
+
     async def list_usergroup_members_page(
         self, group_id: int, page: int, size: int
     ) -> ListResult[UserGroupMember]:

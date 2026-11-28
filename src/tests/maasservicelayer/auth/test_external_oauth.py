@@ -37,6 +37,14 @@ from maasservicelayer.models.external_auth import (
 )
 from maasservicelayer.utils.date import utcnow
 
+FULL_ID_TOKEN_CLAIMS = {
+    "sub": "user123",
+    "email": "testuser@example.com",
+    "given_name": "Test",
+    "family_name": "User",
+    "name": "Test User",
+}
+
 TEST_PROVIDER = OAuthProvider(
     id=1,
     name="Test provider",
@@ -392,6 +400,112 @@ class TestOauth2Client:
         assert (
             details[0].message == "Claim 'sub' does not match ID token 'sub'."
         )
+
+    def _group_sync_provider(
+        self, claim: str = "groups", userinfo_endpoint: str | None = None
+    ) -> OAuthProvider:
+        return TEST_PROVIDER.model_copy(
+            update={
+                "config": {"group_sync": {"enabled": True, "claim": claim}},
+                "metadata": TEST_PROVIDER.metadata.model_copy(
+                    update={"userinfo_endpoint": userinfo_endpoint}
+                ),
+            }
+        )
+
+    async def test_get_userinfo_ignores_groups_when_sync_disabled(
+        self,
+    ) -> None:
+        claims = JWTClaims(
+            payload={**FULL_ID_TOKEN_CLAIMS, "groups": ["admins"]}, header={}
+        )
+        client = OAuth2Client(TEST_PROVIDER)
+
+        response = await client.get_userinfo(
+            access_token="mock_token", id_token_claims=claims
+        )
+
+        assert response.groups is None
+
+    async def test_get_userinfo_reads_groups_from_id_token(self) -> None:
+        claims = JWTClaims(
+            payload={
+                **FULL_ID_TOKEN_CLAIMS,
+                "roles": ["admins", "/maas/operators"],
+            },
+            header={},
+        )
+        client = OAuth2Client(self._group_sync_provider(claim="roles"))
+        client._userinfo_request = AsyncMock()
+
+        response = await client.get_userinfo(
+            access_token="mock_token", id_token_claims=claims
+        )
+
+        assert response.groups == ["admins", "operators"]
+        client._userinfo_request.assert_not_awaited()
+
+    async def test_get_userinfo_reads_groups_from_userinfo(self) -> None:
+        claims = JWTClaims(payload=FULL_ID_TOKEN_CLAIMS, header={})
+        client = OAuth2Client(
+            self._group_sync_provider(
+                userinfo_endpoint="https://issuer.com/userinfo"
+            )
+        )
+        client._userinfo_request = AsyncMock(
+            return_value={"sub": "user123", "groups": "admins"}
+        )
+
+        response = await client.get_userinfo(
+            access_token="mock_token", id_token_claims=claims
+        )
+
+        assert response.groups == ["admins"]
+        assert response.email == "testuser@example.com"
+
+    async def test_get_userinfo_groups_missing_without_userinfo_endpoint(
+        self,
+    ) -> None:
+        claims = JWTClaims(payload=FULL_ID_TOKEN_CLAIMS, header={})
+        client = OAuth2Client(self._group_sync_provider())
+        client._userinfo_request = AsyncMock()
+
+        response = await client.get_userinfo(
+            access_token="mock_token", id_token_claims=claims
+        )
+
+        assert response.groups is None
+        client._userinfo_request.assert_not_awaited()
+
+    async def test_get_userinfo_groups_userinfo_failure_keeps_login(
+        self,
+    ) -> None:
+        claims = JWTClaims(payload=FULL_ID_TOKEN_CLAIMS, header={})
+        client = OAuth2Client(
+            self._group_sync_provider(
+                userinfo_endpoint="https://issuer.com/userinfo"
+            )
+        )
+        client._userinfo_request = AsyncMock(side_effect=BadGatewayException())
+
+        response = await client.get_userinfo(
+            access_token="mock_token", id_token_claims=claims
+        )
+
+        assert response.email == "testuser@example.com"
+        assert response.groups is None
+
+    @pytest.mark.parametrize(
+        "raw_groups, expected",
+        [
+            (None, None),
+            ("admins", ["admins"]),
+            (["a", "/x/b", "/c/", "/", 3], ["a", "b", "c"]),
+            ({"not": "a list"}, None),
+        ],
+    )
+    def test_normalize_groups(self, raw_groups, expected) -> None:
+        assert OAuth2Client._normalize_groups(raw_groups) == expected
 
     async def test__fetch_and_validate_tokens_success(self) -> None:
         client = OAuth2Client(TEST_PROVIDER)

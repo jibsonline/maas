@@ -2,9 +2,9 @@
 # GNU Affero General Public License version 3 (see the file LICENSE).
 
 from enum import IntEnum
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from maasservicelayer.models.base import (
     generate_builder,
@@ -35,6 +35,27 @@ class ProviderVendorType(IntEnum):
     KEYCLOAK = 3
 
 
+class OIDCGroupSyncConfig(BaseModel):
+    """Sync MAAS user groups from an ID token or userinfo claim on login.
+
+    With an empty `group_map`, a claim value maps to the MAAS group of the
+    same name and every MAAS group is managed. Otherwise only the groups in
+    `group_map` values are managed, and the rest are left untouched.
+    """
+
+    CONFIG_KEY: ClassVar[str] = "group_sync"
+
+    enabled: bool = False
+    claim: str = Field(default="groups", min_length=1)
+    group_map: dict[str, str] = Field(default_factory=dict)
+
+    @classmethod
+    def from_provider_config(
+        cls, config: dict[str, Any] | None
+    ) -> "OIDCGroupSyncConfig":
+        return cls.model_validate((config or {}).get(cls.CONFIG_KEY, {}))
+
+
 @generate_builder()
 class OAuthProvider(MaasTimestampedBaseModel):
     issuer_url: str
@@ -48,3 +69,7 @@ class OAuthProvider(MaasTimestampedBaseModel):
     enabled: bool
     metadata: ProviderMetadata
     config: dict[str, Any] | None = None
+
+    @property
+    def group_sync(self) -> OIDCGroupSyncConfig:
+        return OIDCGroupSyncConfig.from_provider_config(self.config)

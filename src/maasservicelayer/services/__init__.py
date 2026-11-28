@@ -709,6 +709,7 @@ class ServiceCollectionV3:
             external_oauth_repository=ExternalOAuthRepository(context),
             secrets_service=services.secrets,
             users_service=services.users,
+            usergroups_service=services.usergroups,
             revoked_tokens_service=services.oidc_revoked_tokens,
             cache=cache.get(
                 ExternalOAuthService.__name__,

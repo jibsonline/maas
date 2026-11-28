@@ -2,6 +2,7 @@
 # GNU Affero General Public License version 3 (see the file LICENSE).
 
 import base64
+from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from httpx import AsyncClient
@@ -57,6 +58,7 @@ from maasservicelayer.models.users import User
 from maasservicelayer.services.base import BaseService, Service, ServiceCache
 from maasservicelayer.services.secrets import SecretNotFound, SecretsService
 from maasservicelayer.services.tokens import OIDCRevokedTokenService
+from maasservicelayer.services.usergroups import UserGroupsService
 from maasservicelayer.services.users import UsersService
 from maasservicelayer.utils.date import utcnow
 from maasservicelayer.utils.encryptor import Encryptor
@@ -94,11 +96,13 @@ class ExternalOAuthService(
         revoked_tokens_service: OIDCRevokedTokenService,
         secrets_service: SecretsService,
         users_service: UsersService,
+        usergroups_service: UserGroupsService,
         cache: ExternalOAuthServiceCache | None = None,
     ):
         super().__init__(context, external_oauth_repository, cache)
         self.secrets_service = secrets_service
         self.users_service = users_service
+        self.usergroups_service = usergroups_service
         self.revoked_tokens_service = revoked_tokens_service
 
     @staticmethod
@@ -229,6 +233,9 @@ class ExternalOAuthService(
                     is_local=False, provider_id=client.provider.id
                 ),
             )
+        await self.sync_user_groups(
+            user, client.provider, data.user_info.groups
+        )
         logger.info(
             AUTHN_LOGIN_SUCCESSFUL,
             type=SECURITY,
@@ -237,6 +244,62 @@ class ExternalOAuthService(
         )
 
         return data.tokens
+
+    async def sync_user_groups(
+        self,
+        user: User,
+        provider: OAuthProvider,
+        groups: list[str] | None,
+    ) -> None:
+        """Set the user's MAAS groups from the provider's groups claim.
+
+        Does nothing when group sync is off or the claim is missing, so a
+        provider that stops sending the claim can't strip everyone's
+        access. Errors are logged and never block the login.
+        """
+        group_sync = provider.group_sync
+        if not group_sync.enabled or groups is None:
+            return
+        try:
+            maas_groups = {
+                group.name: group.id
+                for group in await self.usergroups_service.list_all()
+            }
+            if group_sync.group_map:
+                managed = {
+                    name
+                    for name in group_sync.group_map.values()
+                    if name in maas_groups
+                }
+                wanted = {
+                    group_sync.group_map[group]
+                    for group in groups
+                    if group in group_sync.group_map
+                }
+            else:
+                managed = set(maas_groups)
+                wanted = set(groups)
+            current = await self.usergroups_service.list_group_ids_for_user(
+                user.id
+            )
+            for name in sorted(managed):
+                group_id = maas_groups[name]
+                if name in wanted and group_id not in current:
+                    await self.usergroups_service.add_user_to_group_by_id(
+                        user.id, group_id
+                    )
+                    logger.info(
+                        f"OIDC group sync added {user.username} to {name}"
+                    )
+                elif name not in wanted and group_id in current:
+                    await self.usergroups_service.remove_user_from_group(
+                        group_id, user.id
+                    )
+                    logger.info(
+                        f"OIDC group sync removed {user.username} from {name}"
+                    )
+        except Exception:
+            logger.exception(f"OIDC group sync failed for {user.username}")
 
     async def revoke_token(self, id_token: str, refresh_token: str) -> None:
         token_hash = hash_token_for_logging(refresh_token)
@@ -379,6 +442,10 @@ class ExternalOAuthService(
     ) -> OAuthProvider | None:
         enable_requested = builder.enabled is True
         existing_enabled = await self.get_provider()
+        if not isinstance(builder.config, Unset):
+            builder.config = await self._merge_provider_config(
+                id, builder.config
+            )
         if not isinstance(builder.issuer_url, Unset):
             builder.issuer_url = builder.issuer_url.rstrip("/")
 
@@ -399,6 +466,15 @@ class ExternalOAuthService(
                 )
             ]
         )
+
+    async def _merge_provider_config(
+        self, id: int, config: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Keep config keys the update doesn't set, such as other features."""
+        existing = await self.get_by_id(id)
+        if existing is None or not existing.config:
+            return config
+        return {**existing.config, **(config or {})}
 
     async def get_encryptor(self) -> Encryptor:
         encryption_key = await self._get_or_create_cached_encryption_key()

@@ -16,6 +16,7 @@ from maasservicelayer.db.repositories.usergroups import (
     UserGroupsRepository,
 )
 from maasservicelayer.db.repositories.usergroups_members import (
+    UserGroupMembersClauseFactory,
     UserGroupMembersRepository,
 )
 from maasservicelayer.db.tables import OpenFGATupleTable
@@ -216,6 +217,29 @@ class TestUserGroupsService:
         result = await service.list_usergroup_members(1)
         assert result == members
         usergroup_members_repository.list_all.assert_awaited_once()
+
+    async def test_list_group_ids_for_user(self) -> None:
+        usergroup_members_repository = Mock(UserGroupMembersRepository)
+        usergroup_members_repository.list_all.return_value = [
+            UserGroupMember(
+                id=10, group_id=1, username="user1", email="u1@test.com"
+            ),
+            UserGroupMember(
+                id=10, group_id=3, username="user1", email="u1@test.com"
+            ),
+        ]
+
+        service = UserGroupsService(
+            context=Context(),
+            usergroups_repository=Mock(UserGroupsRepository),
+            usergroup_members_repository=usergroup_members_repository,
+            openfga_tuples_service=Mock(OpenFGATupleService),
+        )
+
+        assert await service.list_group_ids_for_user(10) == {1, 3}
+        usergroup_members_repository.list_all.assert_awaited_once_with(
+            QuerySpec(where=UserGroupMembersClauseFactory.with_id(10))
+        )
 
     async def test_list_groups_statistics(self) -> None:
         usergroups_repository = Mock(UserGroupsRepository)
